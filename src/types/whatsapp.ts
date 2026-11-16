@@ -293,7 +293,7 @@ export interface SuperadminWaQueueItem {
   id: string;
   recipient_phone: string;
   message: string;
-  category: 'order_notification' | 'password_reset' | 'system_otp';
+  category: 'order_notification' | 'password_reset' | 'system_otp' | 'session_expired';
   owner_user_id?: string;
   invoice_number?: string;
   attempts: number;

@@ -1539,6 +1539,7 @@ export async function syncPushStructureAndData(configOverride?: MysqlConfigOverr
     await pushKvSettingToMysql('catalogProducts', db.catalogProducts || []);
     await pushKvSettingToMysql('catalogSettings', db.catalogSettings || {});
     await pushKvSettingToMysql('superadminWaQueue', db.superadminWaQueue || []);
+    await pushKvSettingToMysql('expiredSessionAlertKeys', db.expiredSessionAlertKeys || {});
     logs.push('✓ Konfigurasi paket, anti-ban, QRIS, katalog Mini Shop, antrean WA Superadmin, dan pengaturan sistem disinkronkan.');
 
     return {

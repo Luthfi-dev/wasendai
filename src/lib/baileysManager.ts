@@ -37,7 +37,12 @@ import {
   isPhoneMetaAiVerifiedForUser,
   markUserMetaAiVerified,
   updateUser,
-  resolveEffectiveSessionAiSettings
+  resolveEffectiveSessionAiSettings,
+  getWhitelabelConfig,
+  resolvePublicAppBaseUrl,
+  hasSessionExpiryAlertSent,
+  markSessionExpiryAlertSent,
+  clearSessionExpiryAlertSent
 } from './db.js';
 import {
   askMetaAiViaBaileys,
@@ -133,6 +138,7 @@ interface SessionState {
   lastUpdated: number;
   handshakeStartedAt: number;
   retryCount: number;
+  disconnectedSince?: number;
   is_primary?: boolean;
   detachRawHandlers?: () => void;
 }
@@ -143,6 +149,7 @@ const authBackupTimers = new Map<string, NodeJS.Timeout>();
 const lastAuthBackupAt = new Map<string, number>();
 const lastAuthBackupHashes = new Map<string, string>();
 const reconnectTimers = new Map<string, NodeJS.Timeout>();
+const inFlightExpiryAlerts = new Set<string>();
 const AUTH_DIR = path.resolve(process.cwd(), 'baileys_auth_sessions');
 const UNSCANNED_HANDSHAKE_TTL_MS = 3 * 60 * 1000;
 const MAX_RECONNECT_RETRIES = 5;
@@ -150,6 +157,98 @@ const AUTH_BACKUP_DEBOUNCE_MS = 30000;
 const AUTH_BACKUP_COOLDOWN_MS = 120000;
 const PRUNE_COOLDOWN_MS = 90000;
 const MYSQL_AUTH_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
+
+function clearSessionExpiryNotificationCooldown(sessionId: string, ownerUserId?: string, phone?: string) {
+  const cleanPhone = normalizePhoneNumber(phone || '');
+  const keysToClear: string[] = [];
+  if (sessionId) keysToClear.push(sessionId);
+  if (ownerUserId) {
+    if (sessionId) keysToClear.push(`${ownerUserId}:${sessionId}`);
+    if (cleanPhone) keysToClear.push(`${ownerUserId}:${cleanPhone}`);
+  }
+  clearSessionExpiryAlertSent(keysToClear);
+}
+
+export async function notifyUserSessionExpired(params: {
+  sessionId: string;
+  sessionName?: string;
+  expiredPhone?: string;
+  userId?: string;
+  reason?: string;
+}): Promise<{ notified: boolean; skipped?: string; queued?: boolean }> {
+  const dbSess = getSessionById(params.sessionId);
+  const resolvedPhone = normalizePhoneNumber(
+    params.expiredPhone || dbSess?.phone_number || getCredsPhoneOnDisk(params.sessionId) || ''
+  );
+  const owner = resolveActiveVerifiedOwner(params.sessionId, params.userId || dbSess?.user_id, resolvedPhone);
+  if (!isOwnerActiveAndRegistered(owner)) {
+    return { notified: false, skipped: 'owner_inactive' };
+  }
+
+  const recipientPhone = normalizePhoneNumber(owner!.phone || '');
+  if (!recipientPhone || recipientPhone.length < 8) {
+    return { notified: false, skipped: 'missing_owner_phone' };
+  }
+
+  const dedupeKeys = Array.from(
+    new Set(
+      [
+        resolvedPhone ? `${owner!.id}:${resolvedPhone}` : `${owner!.id}:${params.sessionId}`,
+        `${owner!.id}:${params.sessionId}`
+      ].filter(Boolean)
+    )
+  );
+
+  if (dedupeKeys.some(k => inFlightExpiryAlerts.has(k)) || hasSessionExpiryAlertSent(dedupeKeys)) {
+    return { notified: false, skipped: 'already_notified_until_relogin' };
+  }
+
+  // Avoid queuing a self-notification loop if the only admin WA session itself is disconnected
+  if (owner!.role === 'admin' && !resolveConnectedSuperadminSession()) {
+    console.warn(
+      `[Baileys Expiry Alert] Sesi Superadmin ${params.sessionId} (+${resolvedPhone || '-'}) terputus/expired: ${params.reason || '-'}`
+    );
+    return { notified: false, skipped: 'admin_no_fallback_session' };
+  }
+
+  const wl = getWhitelabelConfig();
+  const appName = (wl?.app_name || 'Japriin').trim();
+  const publicUrl = resolvePublicAppBaseUrl();
+  const deviceLabel =
+    params.sessionName || dbSess?.session_name || (resolvedPhone ? `WA +${resolvedPhone}` : params.sessionId);
+  const numberDisplay = resolvedPhone ? `+${resolvedPhone}` : deviceLabel;
+  const reasonText = params.reason || 'sesi login WhatsApp sudah kedaluwarsa / terputus dari perangkat';
+  const urlLine = publicUrl ? `\n🔗 Login di: ${publicUrl}` : '';
+
+  const message =
+    `⚠️ *Pemberitahuan Koneksi WhatsApp Terputus*\n\n` +
+    `Halo *${owner!.name || owner!.username}* 👋\n\n` +
+    `Sesi login WhatsApp *${numberDisplay}* (${deviceLabel}) di *${appName}* telah *terputus / logout* (${reasonText}).\n\n` +
+    `📲 Silakan *login kembali ke aplikasi* dan *sambungkan ulang perangkat WhatsApp* di menu *Koneksi WA* agar dapat kembali merespon chat customer.${urlLine}\n\n` +
+    `_Pemberitahuan ini hanya dikirim satu kali sampai Anda menyambungkan kembali perangkat tersebut._`;
+
+  for (const k of dedupeKeys) inFlightExpiryAlerts.add(k);
+  try {
+    const sendRes = await sendOrQueueViaSuperadminWa({
+      recipientPhone,
+      message,
+      category: 'session_expired',
+      ownerUserId: owner!.id,
+      invoiceNumber: `exp_${owner!.id}_${resolvedPhone || params.sessionId}`
+    });
+
+    if (sendRes.sent || sendRes.queued) {
+      markSessionExpiryAlertSent(dedupeKeys);
+    }
+
+    console.log(
+      `[Baileys Expiry Alert] User=${owner!.username} (${recipientPhone}) Session=${params.sessionId} Sent=${sendRes.sent} Queued=${sendRes.queued}`
+    );
+    return { notified: sendRes.sent || sendRes.queued, queued: sendRes.queued };
+  } finally {
+    for (const k of dedupeKeys) inFlightExpiryAlerts.delete(k);
+  }
+}
 
 export function buildBaileysSocketConfig(version: [number, number, number], logger: any, authState: any) {
   return {
@@ -1689,8 +1788,10 @@ export async function getOrStartBaileysSession(
           sessionData.pairingCode = null;
           sessionData.lastUpdated = Date.now();
           sessionData.retryCount = 0;
+          sessionData.disconnectedSince = undefined;
           sessionData.userId = owner!.id;
           sessionData.is_primary = Boolean(getSessionById(sessionId)?.is_primary);
+          clearSessionExpiryNotificationCooldown(sessionId, owner!.id, connectedUser);
           activeSessions.set(sessionId, sessionData);
           scheduleAuthFolderBackup(sessionId, true);
 
@@ -1772,6 +1873,19 @@ export async function getOrStartBaileysSession(
 
           if (isFatal) {
             console.warn(`[Baileys Auto-Purge] Sesi ${sessionId} terputus permanen (status ${statusCode}). Menghapus kredensial & data sesi...`);
+            const existingMeta = getSessionById(sessionId);
+            const wasPreviouslyLinked = isRegistered || Boolean(sessionData.phoneNumber) || existingMeta?.status === 'connected';
+            if (wasPreviouslyLinked) {
+              await notifyUserSessionExpired({
+                sessionId,
+                sessionName: existingMeta?.session_name,
+                expiredPhone: sessionData.phoneNumber || existingMeta?.phone_number,
+                userId: sessionData.userId || existingMeta?.user_id,
+                reason: statusCode === DisconnectReason.loggedOut || statusCode === 401
+                  ? 'keluar / terputus dari Perangkat Tertaut di HP'
+                  : `terputus permanen (kode ${statusCode})`
+              }).catch(() => {});
+            }
             await purgeBaileysSessionCompletely(sessionId, sessionData.phoneNumber || undefined);
             return;
           }
@@ -1797,6 +1911,7 @@ export async function getOrStartBaileysSession(
               // Keep registered credentials & DB session intact so watchdog heals cleanly without forcing re-scan
               console.warn(`[Baileys Keep-Alive] Sesi terdaftar ${sessionId} mencapai batas retry cepat (${MAX_RECONNECT_RETRIES}x). Menyimpan kredensial untuk pemulihan watchdog otomatis.`);
               sessionData.status = 'disconnected';
+              sessionData.disconnectedSince = sessionData.disconnectedSince || Date.now();
               sessionData.retryCount = 0;
               activeSessions.set(sessionId, sessionData);
               return;
@@ -1945,7 +2060,9 @@ export async function requestBaileysPairingCode(
       sessionData.pairingCode = null;
       sessionData.lastUpdated = Date.now();
       sessionData.retryCount = 0;
+      sessionData.disconnectedSince = undefined;
       sessionData.userId = owner!.id;
+      clearSessionExpiryNotificationCooldown(sessionId, owner!.id, connectedUser);
       activeSessions.set(sessionId, sessionData);
       scheduleAuthFolderBackup(sessionId, true);
 
@@ -2023,6 +2140,18 @@ export async function requestBaileysPairingCode(
 
       if (isFatal || (!isRegistered && statusCode !== DisconnectReason.restartRequired)) {
         console.warn(`[Baileys Pairing Auto-Purge] Sesi pairing ${sessionId} terputus/batal (${statusCode}). Menghapus sesi & folder...`);
+        const existingMeta = getSessionById(sessionId);
+        if (isFatal && (isRegistered || existingMeta?.status === 'connected')) {
+          await notifyUserSessionExpired({
+            sessionId,
+            sessionName: existingMeta?.session_name,
+            expiredPhone: sessionData.phoneNumber || cleanPhone || existingMeta?.phone_number,
+            userId: sessionData.userId || userId || existingMeta?.user_id,
+            reason: statusCode === DisconnectReason.loggedOut || statusCode === 401
+              ? 'keluar / terputus dari Perangkat Tertaut di HP'
+              : `terputus permanen (kode ${statusCode})`
+          }).catch(() => {});
+        }
         await purgeBaileysSessionCompletely(sessionId, cleanPhone);
         return;
       }
@@ -2032,6 +2161,7 @@ export async function requestBaileysPairingCode(
         if (isRegistered) {
           console.warn(`[Baileys Pairing Keep-Alive] Sesi terdaftar ${sessionId} menyimpan kredensial untuk pemulihan watchdog.`);
           sessionData.status = 'disconnected';
+          sessionData.disconnectedSince = sessionData.disconnectedSince || Date.now();
           sessionData.retryCount = 0;
           activeSessions.set(sessionId, sessionData);
           return;
@@ -2410,11 +2540,29 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
     }
 
     if (s.expires_at && new Date(s.expires_at).getTime() < now) {
+      if (s.phone_number) {
+        await notifyUserSessionExpired({
+          sessionId: s.id,
+          sessionName: s.session_name,
+          expiredPhone: s.phone_number,
+          userId: s.user_id,
+          reason: 'masa aktif sesi login telah habis (expired)'
+        }).catch(() => {});
+      }
       await doPurge(s.id, s.phone_number, 'masa aktif sesi berakhir');
       continue;
     }
 
     if (s.status === 'disconnected' && !hasOpenSocket && !hasRegisteredCredsOnDisk(s.id)) {
+      if (s.phone_number && s.connected_at) {
+        await notifyUserSessionExpired({
+          sessionId: s.id,
+          sessionName: s.session_name,
+          expiredPhone: s.phone_number,
+          userId: s.user_id,
+          reason: 'sesi WhatsApp terputus dan kredensial login tidak aktif lagi'
+        }).catch(() => {});
+      }
       await doPurge(s.id, s.phone_number, 'status sesi disconnected tanpa kredensial tersimpan');
       continue;
     }
@@ -2609,6 +2757,25 @@ export async function restoreSavedBaileysSessions() {
       `[Baileys Persistent Storage] Found ${sessionIdsToRestore.size} active registered WhatsApp session(s) to restore.`
     );
 
+    // Notify owners of any previously connected sessions that cannot be restored on startup/build
+    for (const s of dbSessions) {
+      if (s.id && s.status === 'connected' && !sessionIdsToRestore.has(s.id)) {
+        const owner = resolveActiveVerifiedOwner(s.id, s.user_id, s.phone_number);
+        if (!isOwnerActiveAndRegistered(owner)) continue;
+        const isExpiredByDate = Boolean(s.expires_at && new Date(s.expires_at).getTime() < Date.now());
+        updateSession(s.id, { status: 'disconnected' });
+        await notifyUserSessionExpired({
+          sessionId: s.id,
+          sessionName: s.session_name,
+          expiredPhone: s.phone_number,
+          userId: owner!.id,
+          reason: isExpiredByDate
+            ? 'masa aktif sesi berakhir saat aplikasi di-restart'
+            : 'kredensial login tidak ditemukan setelah build/restart server'
+        }).catch(() => {});
+      }
+    }
+
     for (const sid of sessionIdsToRestore) {
       const existing = activeSessions.get(sid);
       if (!existing || existing.status !== 'connected' || !isSocketTrulyOpen(existing.socket)) {
@@ -2629,52 +2796,93 @@ export async function restoreSavedBaileysSessions() {
   }
 }
 
-// Background Keep-Alive, Auto-Heal & Auto-Purge Watchdog (every 120s)
-const baileysWatchdogTimer = setInterval(async () => {
-  try {
-    const now = Date.now();
-    cleanupExpiredCommandStates(now);
-    if (recentBotOutgoingTexts.size > 0) {
-      for (const [k, time] of recentBotOutgoingTexts.entries()) {
-        if (now - time > 45000) recentBotOutgoingTexts.delete(k);
-      }
+export async function runBaileysPeriodicHealthCheck(): Promise<{
+  checked: number;
+  healed: number;
+  notified: number;
+}> {
+  const now = Date.now();
+  let checked = 0;
+  let healed = 0;
+  let notified = 0;
+
+  cleanupExpiredCommandStates(now);
+  if (recentBotOutgoingTexts.size > 0) {
+    for (const [k, time] of recentBotOutgoingTexts.entries()) {
+      if (now - time > 45000) recentBotOutgoingTexts.delete(k);
     }
-
-    await pruneInactiveAndUnregisteredBaileysSessions();
-
-    const dbSessions = getWhatsAppSessions();
-    for (const s of dbSessions) {
-      if (s.id && s.status === 'connected') {
-        const mem = activeSessions.get(s.id);
-        if (mem && mem.status === 'connected' && isSocketTrulyOpen(mem.socket)) {
-          continue;
-        }
-        const isConnectingRecently =
-          mem && mem.status === 'connecting' && Date.now() - mem.lastUpdated < 35000;
-        if (isConnectingRecently) continue;
-
-        let hasCreds = hasRegisteredCredsOnDisk(s.id);
-        if (!hasCreds) {
-          hasCreds = await hydrateSessionAuthFolderFromMysql(s.id).catch(() => false);
-        }
-        if (!hasCreds) continue;
-
-        const owner = resolveActiveVerifiedOwner(s.id, s.user_id, s.phone_number);
-        if (!isOwnerActiveAndRegistered(owner)) continue;
-
-        console.log(
-          `[Baileys Watchdog] Auto-healing session ${s.id} (${s.phone_number || 'active'})...`
-        );
-        getOrStartBaileysSession(s.id, s.phone_number, owner!.id || s.user_id).catch(() => {});
-      }
-    }
-
-    if (getSuperadminWaQueue().length > 0 && resolveConnectedSuperadminSession()) {
-      drainSuperadminWaQueue('watchdog').catch(() => {});
-    }
-  } catch {
-    // Silent watchdog error
   }
+
+  await pruneInactiveAndUnregisteredBaileysSessions();
+
+  const dbSessions = getWhatsAppSessions();
+  for (const s of dbSessions) {
+    if (!s.id || s.status !== 'connected') continue;
+    checked++;
+
+    const mem = activeSessions.get(s.id);
+    if (mem && mem.status === 'connected' && isSocketTrulyOpen(mem.socket)) {
+      continue;
+    }
+
+    const isConnectingRecently =
+      mem && mem.status === 'connecting' && now - mem.lastUpdated < 35000;
+    if (isConnectingRecently) continue;
+
+    const owner = resolveActiveVerifiedOwner(s.id, s.user_id, s.phone_number);
+    if (!isOwnerActiveAndRegistered(owner)) continue;
+
+    let hasCreds = hasRegisteredCredsOnDisk(s.id);
+    if (!hasCreds) {
+      hasCreds = await hydrateSessionAuthFolderFromMysql(s.id).catch(() => false);
+    }
+
+    if (!hasCreds) {
+      updateSession(s.id, { status: 'disconnected' });
+      const alertRes = await notifyUserSessionExpired({
+        sessionId: s.id,
+        sessionName: s.session_name,
+        expiredPhone: s.phone_number,
+        userId: owner!.id,
+        reason: 'kredensial login WhatsApp sudah tidak valid atau terputus'
+      }).catch(() => ({ notified: false }));
+      if (alertRes.notified) notified++;
+      continue;
+    }
+
+    if (
+      mem &&
+      mem.status === 'disconnected' &&
+      mem.disconnectedSince &&
+      now - mem.disconnectedSince >= 5 * 60 * 1000
+    ) {
+      const alertRes = await notifyUserSessionExpired({
+        sessionId: s.id,
+        sessionName: s.session_name,
+        expiredPhone: s.phone_number,
+        userId: owner!.id,
+        reason: 'koneksi WhatsApp terputus lebih dari 5 menit dan gagal pulih otomatis'
+      }).catch(() => ({ notified: false }));
+      if (alertRes.notified) notified++;
+    }
+
+    console.log(
+      `[Baileys Watchdog] Auto-healing session ${s.id} (${s.phone_number || 'active'})...`
+    );
+    healed++;
+    getOrStartBaileysSession(s.id, s.phone_number, owner!.id || s.user_id).catch(() => {});
+  }
+
+  if (getSuperadminWaQueue().length > 0 && resolveConnectedSuperadminSession()) {
+    drainSuperadminWaQueue('watchdog').catch(() => {});
+  }
+
+  return { checked, healed, notified };
+}
+
+// Background Keep-Alive, Auto-Heal, Expiry Check & Notification Watchdog (every 120s)
+const baileysWatchdogTimer = setInterval(() => {
+  runBaileysPeriodicHealthCheck().catch(() => {});
 }, 120000);
 baileysWatchdogTimer.unref?.();
 
@@ -3135,7 +3343,7 @@ async function sendDirectlyViaSuperadminSocket(
 export async function sendOrQueueViaSuperadminWa(params: {
   recipientPhone: string;
   message: string;
-  category: 'order_notification' | 'password_reset' | 'system_otp';
+  category: 'order_notification' | 'password_reset' | 'system_otp' | 'session_expired';
   ownerUserId?: string;
   invoiceNumber?: string;
 }): Promise<{

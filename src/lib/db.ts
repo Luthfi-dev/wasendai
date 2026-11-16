@@ -74,6 +74,10 @@ function loadEncryptedLocalDb(): LocalDatabase | null {
       catalogProducts: Array.isArray(parsed.catalogProducts) ? parsed.catalogProducts : [],
       catalogSettings: parsed.catalogSettings && typeof parsed.catalogSettings === 'object' ? parsed.catalogSettings : {},
       superadminWaQueue: Array.isArray(parsed.superadminWaQueue) ? parsed.superadminWaQueue : [],
+      expiredSessionAlertKeys:
+        parsed.expiredSessionAlertKeys && typeof parsed.expiredSessionAlertKeys === 'object'
+          ? parsed.expiredSessionAlertKeys
+          : {},
       stats: parsed.stats || {
         total_incoming: 0,
         total_auto_replied: 0,
@@ -365,6 +369,9 @@ export function replaceRuntimeDatabaseFromMysql(remote: any): void {
       }
       db.superadminWaQueue = Array.from(mergedQueue.values()).slice(0, 500);
     }
+    if (remote.kvMap.expiredSessionAlertKeys && typeof remote.kvMap.expiredSessionAlertKeys === 'object') {
+      db.expiredSessionAlertKeys = { ...remote.kvMap.expiredSessionAlertKeys };
+    }
     if (remote.kvMap.stats) {
       db.stats = { ...db.stats, ...remote.kvMap.stats };
     }
@@ -434,6 +441,7 @@ export interface LocalDatabase {
   catalogProducts?: CatalogProduct[];
   catalogSettings?: Record<string, CatalogSettings>;
   superadminWaQueue?: SuperadminWaQueueItem[];
+  expiredSessionAlertKeys?: Record<string, string>;
   stats: {
     total_incoming: number;
     total_auto_replied: number;
@@ -691,6 +699,7 @@ export function initDbFile(): LocalDatabase {
     catalogProducts: [],
     catalogSettings: {},
     superadminWaQueue: [],
+    expiredSessionAlertKeys: {},
     stats: {
       total_incoming: 0,
       total_auto_replied: 0,
@@ -3640,11 +3649,11 @@ export function enqueueSuperadminWaMessage(item: {
     throw new Error('Nomor WhatsApp tujuan antrean tidak valid.');
   }
 
-  // Deduplicate queued invoice notifications
-  if (item.category === 'order_notification' && item.invoice_number) {
+  // Deduplicate queued invoice and session_expired notifications
+  if ((item.category === 'order_notification' || item.category === 'session_expired') && item.invoice_number) {
     const existing = db.superadminWaQueue.find(
       q =>
-        q.category === 'order_notification' &&
+        q.category === item.category &&
         q.invoice_number === item.invoice_number &&
         normalizePhoneForUniqueness(q.recipient_phone) === cleanPhone
     );
@@ -3699,4 +3708,49 @@ export function removeSuperadminWaQueueItem(id: string): boolean {
     return true;
   }
   return false;
+}
+
+export function hasSessionExpiryAlertSent(keys: string[]): boolean {
+  const db = initDbFile();
+  const map = db.expiredSessionAlertKeys;
+  if (!map || typeof map !== 'object') return false;
+  return keys.some(k => Boolean(k && map[k]));
+}
+
+export function markSessionExpiryAlertSent(keys: string[]): void {
+  const cleanKeys = keys.map(k => String(k || '').trim()).filter(Boolean);
+  if (cleanKeys.length === 0) return;
+  const db = initDbFile();
+  if (!db.expiredSessionAlertKeys || typeof db.expiredSessionAlertKeys !== 'object') {
+    db.expiredSessionAlertKeys = {};
+  }
+  const nowIso = new Date().toISOString();
+  for (const k of cleanKeys) {
+    db.expiredSessionAlertKeys[k] = nowIso;
+  }
+  const entries = Object.entries(db.expiredSessionAlertKeys);
+  if (entries.length > 1000) {
+    db.expiredSessionAlertKeys = Object.fromEntries(entries.slice(-1000));
+  }
+  writeDbFile(db, true);
+  asyncSyncKv('expiredSessionAlertKeys', db.expiredSessionAlertKeys);
+}
+
+export function clearSessionExpiryAlertSent(keys: string[]): void {
+  const cleanKeys = keys.map(k => String(k || '').trim()).filter(Boolean);
+  if (cleanKeys.length === 0) return;
+  const db = initDbFile();
+  const map = db.expiredSessionAlertKeys;
+  if (!map || typeof map !== 'object') return;
+  let changed = false;
+  for (const k of cleanKeys) {
+    if (k in map) {
+      delete map[k];
+      changed = true;
+    }
+  }
+  if (changed) {
+    writeDbFile(db, true);
+    asyncSyncKv('expiredSessionAlertKeys', db.expiredSessionAlertKeys);
+  }
 }
